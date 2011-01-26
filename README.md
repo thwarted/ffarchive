@@ -22,7 +22,7 @@ Developed and tested on python2.7, should work on python2.6.  I believe most of 
 
  * download and create directories named `cache` and `dbs` in the same dir you'll run it from
  * run it as `friendfeed-archive <feedname>`, each feed ends up in its own database file, so if you want to archive a group/room, specifiy the group/room's feedname.
- * put it in cron to run every 15 minutes or so (make sure you cd
+ * put it in cron to run every 15 minutes or so (for now, you'll need to make sure the current directory has the `cache` and `dbs` dirs)
 
 
 # To do (not an exhaustive list)
