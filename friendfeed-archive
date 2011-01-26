@@ -1,0 +1,553 @@
+#!/usr/bin/python
+# vim: fileencoding=utf-8:ai:ts=4:expandtab
+
+"""
+Update a local sqlite3 database with a copy of entries and metadata
+for a friendfeed feed.
+
+Iterate over the entries returned by the V2 API, in groups of 100.
+We only hit the V1 API when an entry doesn't exist in the database.
+
+"""
+
+from __future__ import with_statement
+import calendar
+import copy
+import errno
+from hashlib import md5, sha1
+import inspect
+import optparse
+import os
+import pickle
+import re
+import sys
+import time
+import urllib
+import string
+
+import simplejson
+import sqlite3
+
+from pprint import pprint
+
+MAX_COMMENTS = 1000
+MAX_LIKES = 1000
+
+CACHEDIR = './cache'
+DBDIR = './dbs/'
+
+APIV2_BASE = "http://friendfeed-api.com/v2"
+APIV1_BASE = "http://friendfeed.com/api"
+
+DATE_RE = re.compile(r'^\d\d\d\d-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
+
+DEBUGGING = True
+
+
+def debug(s):
+    if DEBUGGING:
+        calframe = inspect.getouterframes(inspect.currentframe(), 2)
+        who = calframe[1][3]
+        msg = u"(%s) %s\n" % (who, s)
+        sys.stderr.write(msg.encode('utf-8', 'replace'))
+
+
+def date_to_unixtime(datestr):
+    return calendar.timegm(time.strptime(datestr, "%Y-%m-%dT%H:%M:%SZ"))
+
+
+def first(g, check):
+    for c in g:
+        if check(c):
+            return c
+    return None
+
+def utf8(s):
+    if isinstance(s, unicode):
+        return s.encode('utf-8')
+    return s
+
+def download(url, cachedir=None):
+    if not cachedir:
+        cachedir = CACHEDIR
+    fssafeurl = re.sub(r'\W', '_', url)
+    cachefile = os.path.join(cachedir, "cache-%s.%s" % (fssafeurl, sha1(url).hexdigest()))
+    cacheheaders = os.path.join(cachedir, "cache-%s.%s.headers.pickle" % (fssafeurl, sha1(url).hexdigest()))
+    if not os.path.isfile(cachefile) or not os.path.isfile(cacheheaders):
+        debug("downloading %s" % (url,))
+        try:
+            fn, headers = urllib.urlretrieve(url)
+        except IOError, e:
+            sys.stderr.write("url = "+url+"\n")
+            raise(e)
+        with file(fn) as r:
+            with file(cachefile, "w") as w:
+                w.writelines(r.readlines())
+        with file(cacheheaders, "w") as w:
+            w.write(pickle.dumps(headers))
+    else:
+        debug("found cached copy of %s" % (url,))
+        fn = cachefile
+        with file(cacheheaders) as h:
+            headers = pickle.loads(h.read())
+    return (file(fn), headers)
+
+
+def entry_freshness(v2entry):
+    """ given a APIv2 entry, return the date this entry last had activity
+    """
+    edates = [v2entry['date']]
+    if 'comments' in v2entry:
+        for comment in v2entry['comments']:
+            edates.append(comment['date'])
+    if 'likes' in v2entry:
+        for like in v2entry['likes']:
+            edates.append(like['date'])
+    return sorted(edates)[-1]
+
+
+def fixup_dates(d):
+    """ loop over the items of dict d and if any of the items 
+        match \d\d\d\d-\d\d-\d\dT\d\d:\d\d:\d\dZ
+        then add a new item named with _unix suffix with the unix time
+    """
+    if isinstance(d, dict):
+        for k,v in d.items():
+            if isinstance(v, basestring) and DATE_RE.match(v):
+                d[k+"_unix"] = date_to_unixtime(v)
+            elif isinstance(v, list) or isinstance(v, dict):
+                fixup_dates(v)
+    elif isinstance(d, list):
+        for v in d:
+            fixup_dates(v)
+
+
+def fixup_thumbnails(merged):
+    """ find data in the v1 "media" entries that can suppliment the thumbnails data in v2
+         - find a (base)name for media and thumbnails so links are to a 
+           more meaningful filename (making them easier to download,
+           and the basename is sometimes descriptive).  We don't set this
+           if we don't find one -- the front end will then try to generate
+           a unique name
+         - find a better title (the "tooltip") to use on thumbnails (in
+           v2, the title appears to be the body of the entry); we want this
+           to be the basename of the file, if possible
+         - make the v2 thumbnail entries look a little more like the v2 files
+           entries, although some data like the size and mimetype will be
+           stored in the media table
+
+    """
+    def v1media_for_v2thumbnail(v1media, v2thumbnail):
+        """ return the APIv1 media entry that matches the passed in APIv2 thumbnail entry
+        """
+        for v1m in v1media:
+            if "thumbnails" in v1m and v1m['thumbnails'] and len(v1m['thumbnails']) == 1:
+                v1t = v1m['thumbnails'][0]
+                if v1t['url'] == v2thumbnail['url']:
+                    return v1m
+        return None
+
+    if 'thumbnails' not in merged:
+        return
+
+    for thumb in merged['thumbnails']:
+        v1media = v1media_for_v2thumbnail(merged['media'], thumb)
+
+        if v1media:
+            # find a reasonable basename by examining the basename of the url and link
+            # for the media entry
+            for x in ('url', 'link'):
+                name = os.path.basename(thumb[x])
+                # if it looks like the basename has an extension, use that
+                if "." in name:
+                    thumb['name'] = name
+                else:
+                    # FIXME "." in basename is a lame test that it has a file extension
+                    name = None
+                    try:
+                        # grab the first one that has a url key
+                        # there seems to be only one entry in the content list anyway
+                        contentwithname = first(v1media['content'], lambda x: True if "url" in x else False)
+                        if contentwithname:
+                            name = os.path.basename(contentwithname['url'])
+                            if name:
+                                thumb['name'] = name
+                                break
+                    except Exception, e:
+                        raise(e)
+                        pass
+              
+            # set titles
+            if v1media['title']:
+                thumb['title'] = v1media['title']
+            elif thumb['name']:
+                thumb['title'] = thumb['name']
+            debug("assigning title %r for thumbnail %r from v1 thumbnail" % (thumb['title'], thumb['url']))
+        else:
+            thumb['title'] = merged['title']
+            debug("falling back to assigning title for thumbnail %r from v1 title" % (thumb['url'],))
+
+
+def merge_and_cleanup(v1entry, v2entry):
+    """ merge the v1entry and v2entries in a single, entry that
+        contains everything. and convert some of the data, like dates,
+        into more easily manipulated formats
+    """
+    # all the v1 keys are copied into the v2 structure but have _apiv1
+    # appended to the keyname
+    merged = copy.deepcopy(v2entry)
+    for k,v in copy.deepcopy(v1entry).items():
+        if k in merged:
+            if merged[k] != v:
+                merged[k+'_v1'] = v
+        else:
+            merged[k] = v
+
+    fixup_dates(merged) # modifies in-place
+    fixup_thumbnails(merged) # modifies in-place
+
+    return merged
+
+
+def download_v1(eid):
+    """ download the entry from the v1 API, there is extra data in it
+        that we can use
+    """
+    urlformat = "%(apiv1_base)s/feed/entry?entry_id=%(eid)s&pretty=1"
+    url = urlformat % {'apiv1_base': APIV1_BASE, 'eid': eid}
+    jsonfile, _headers = download(url)
+    ffdata = simplejson.load(jsonfile)
+    if "entries" not in ffdata:
+        return {}
+    if not isinstance(ffdata['entries'], list) or len(ffdata['entries']) != 1:
+        return {}
+    return ffdata['entries'][0]
+
+
+def download_feed_entries(feed, options):
+    """ find entries to download by querying the v2 API for the entries
+        on a specific feed.
+    """
+    def save_entries(v2entries):
+        global ffdb
+        updated_entries = 0
+        for v2e in v2entries:
+            updated_entries += ffdb.store_entry(v2e, force=options.iterateall)
+        return updated_entries
+
+    vars = {'start': 0, 'maxcomments': MAX_COMMENTS, 'maxlikes': MAX_LIKES, 'apiv2_base': APIV2_BASE, 'feed': feed}
+    urlformat = "%(apiv2_base)s/feed/%(feed)s?raw=1&start=%(start)d&num=100&pretty=1&maxcomments=%(maxcomments)d&maxlikes=%(maxlikes)d"
+    while True:
+        url = urlformat % vars
+        jsonfile, _headers = download(url)
+        ffdata = simplejson.load(jsonfile)
+        debug("got %d entries at offset %d" % (len(ffdata['entries']), vars['start']))
+        if not len(ffdata['entries']):
+            # no entries exist at the specified starting entry
+            break
+        updated_entries = save_entries(ffdata['entries'])
+        if updated_entries:
+            vars['start'] += updated_entries
+        else:
+            debug("didn't update any entries from batch at offset %d, no more changed entries after this" % (vars['start']),)
+            break
+
+
+class FriendFeedDatabase:
+    """ all methods here interact with the database in some way
+    """
+    def __init__(self, feedname):
+        self.feedname = feedname
+        self.feedsafename = re.sub(r'\W+', '_', feedname)
+        self.basename = self.feedsafename + '.sqlite3'
+        self.filename = "./dbs/" + self.basename
+        self.db = sqlite3.connect(self.filename)
+        self.create_database_schema()
+
+    def __del__(self):
+        self.db.commit()
+        self.db.close()
+
+    def create_database_schema(self):
+        statements = (
+            """create table if not exists entry (id text, 
+                                              edate text,
+                                         edate_unix integer, -- UNIX timestamp of edate
+                                         lastupdate text,
+                                            deleted integer, -- a boolean flag, if the entry has been deleted
+                                         apiv1_json text, -- the raw APIv1 JSON object for the entry
+                                         apiv2_json text, -- the raw APIv2 JSON object for the entry
+                                         entry_json text, -- a preprocessed, merged version of the v1 and v2 structures
+                                            primary key(id))""",
+            "create index if not exists entryfreshness on entry (lastupdate)",
+
+            """create table if not exists media (url text,
+                                             urlhash text,    -- may be either a hash of the URL or a hash extracted from the URL
+                                           updatedat integer, -- UNIX timestamp
+                                           sizebytes integer, -- the size of the media file
+                                            mimetype text,    -- from the Content-type header
+                                                data blob,
+                                             primary key(url))""",
+            "create index if not exists mediaurlhash on media (urlhash)",
+
+            "create table if not exists services (serviceid text, name text, icon text, servicejson text, primary key(serviceid))",
+            "create table if not exists meta (name text, lastupdate text, json text, primary key (name))",
+            "create table if not exists subscriptions (id text, name text, type text, primary key(id))",
+            "create table if not exists subscribers (id text, name text, type text, primary key(id))"
+        )
+        for stmt in statements:
+            self.db.execute(stmt)
+
+    def show_stats(self):
+        stats = (
+            ('total entries', 'select count(1) from entry', '{0:d}'),
+            ('deleted entries', 'select count(1) from entry where deleted <> 0', '{0:d}'),
+            ('oldest entry', 'select min(edate) from entry', '{0:s}'),
+            ('most recent entry', 'select max(edate) from entry', '{0:s}'),
+            ('', '', ''),
+            ('avg posts per day', "select avg(c) from (select strftime('%Y-%j', edate) as yw, count(1) as c from entry group by 1) as t", '{0:.2f}'),
+            ('avg posts per week', "select avg(c) from (select strftime('%Y-%W', edate) as yw, count(1) as c from entry group by 1) as t", '{0:.2f}'),
+            ('avg posts per month', "select avg(c) from (select strftime('%Y-%m', edate) as yw, count(1) as c from entry group by 1) as t", '{0:.2f}'),
+            ('', '', ''),
+            ('media files', 'select count(1) from media', '{0:d}'),
+            ('media type counts', 'select count(1), mimetype from media group by 2 order by 1 desc', '{0: 4d} {1:s}')
+        )
+        c = self.db.cursor()
+        f = string.Formatter()
+        sys.stdout.write("Statistics for the "+self.feedname+" feed on friendfeed:\n\n")
+        for title, query, fspec in stats:
+            if query:
+                c.execute(query)
+                for result in c.fetchall():
+                    sys.stdout.write(f.format('{title:>20s}  '+fspec+"\n", *result, title=title))
+                    title=''
+            else:
+                sys.stdout.write("\n")
+
+    def all_entries_json_dump(self):
+        c = self.db.cursor()
+        c.execute("select entry_json from entry order by edate")
+        sys.stdout.write("Exporting")
+        sys.stdout.flush()
+        for (e,) in c.fetchall():
+            e = simplejson.loads(e)
+            cachefile = "cache/ff-%s-%s-%s.json" % (self.feedsafename, e['date'].replace(':', ''), e['id'].partition('/')[2],)
+            with file(cachefile , "w") as f:
+                f.write(simplejson.dumps(e, sort_keys=True, indent=4))
+            sys.stdout.write(".")
+            sys.stdout.flush()
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    def have_entry(self, eid, edate, lastupdate):
+        c = self.db.cursor()
+        c.execute("select count(1) from entry where id = ? and edate = ? and lastupdate = ?", (eid, edate, lastupdate))
+        (count,) = c.fetchone()
+        return count > 0
+
+    def have_media(self, url):
+        c = self.db.cursor()
+        c.execute("select count(1), length(data) from media where url = ?", (url,))
+        (count,sizebytes) = c.fetchone()
+        return sizebytes if count > 0 else None
+
+    def store_entry(self, v2entry, force=False):
+        """
+        Store the entry to the database if the passed in data is newer than what is in the database.
+        Will download and merge in the v1 data for this entry also
+
+        returns the number of entries stored (0 or 1)
+        """
+        eid = v2entry['id']
+
+        with file("cache/entry-%s-v2.json"%(eid.partition('/')[2],), "w") as f:
+            f.write(simplejson.dumps(v2entry, sort_keys=True, indent=4))
+
+        edate = v2entry['date']
+        lastupdate = entry_freshness(v2entry)
+        if not force and self.have_entry(eid, edate, lastupdate):
+            return 0
+
+        v1entry = download_v1(v2entry['id'].partition('/')[2])
+        with file("cache/entry-%s-v1.json"%(eid.partition('/')[2],), "w") as f:
+            f.write(simplejson.dumps(v1entry, sort_keys=True, indent=4))
+
+        mergedentry = merge_and_cleanup(v1entry, v2entry)
+        with file("cache/entry-%s-merged.json"%(eid.partition('/')[2],), "w") as f:
+            f.write(simplejson.dumps(mergedentry, sort_keys=True, indent=4))
+
+        c = self.db.cursor()
+        v1json = simplejson.dumps(v1entry)
+        v2json = simplejson.dumps(v2entry)
+        mgjson = simplejson.dumps(mergedentry)
+        edate_unix = mergedentry['date_unix']
+        c.execute("""insert or replace into entry 
+                (id, edate, edate_unix, lastupdate, deleted, apiv1_json, apiv2_json, entry_json)
+                values
+                (?,?,?,?,?,?,?,?)""", 
+                (eid, edate, edate_unix, lastupdate, 0, v1json, v2json, mgjson))
+        self.db.commit()
+        debug("wrote entry %s" % (eid,))
+        self.download_entrys_media(mergedentry)
+        return 1
+
+    def all_entries_remerge(self):
+        c = self.db.cursor()
+        u = self.db.cursor()
+        entries = c.execute("select id, apiv1_json, apiv2_json from entry")
+        for eid, apiv1_json, apiv2_json in entries:
+            start = time.time()
+            sys.stderr.write("remerging entry %s" % (eid,))
+            v1entry = simplejson.loads(apiv1_json)
+            v2entry = simplejson.loads(apiv2_json)
+            merged = merge_and_cleanup(v1entry, v2entry)
+            edate = v2entry['date']
+            edate_unix = merged['date_unix']
+            lastupdate = entry_freshness(v2entry)
+            v =(simplejson.dumps(merged), edate, edate_unix, lastupdate, eid)
+            u.execute("update entry set entry_json = ?, edate = ?, edate_unix = ?, lastupdate = ? where id = ?", v)
+            sys.stderr.write(" took %0.4fs\n" % (time.time() - start))
+
+    def all_entries_get_media(self):
+        c = self.db.cursor()
+        entries = c.execute("select id, entry_json from entry")
+        for eid, entry_json in entries:
+            start = time.time()
+            sys.stderr.write("downloading media for entry %s" % (eid,))
+            entry = simplejson.loads(entry_json)
+            (total_downloads, total_size) = self.download_entrys_media(entry, force=True)
+            sys.stderr.write(" took %0.4fs (%d files, %d bytes)\n" % ((time.time() - start), total_downloads, total_size))
+
+    def download_entrys_media(self, entry, force=False):
+        total_downloads = 0
+        total_size = 0
+        if "files" in entry:
+            for f in entry['files']:
+                (downloaded, sizebytes) = self.download_media_file(f['icon'], force)
+                total_downloads += downloaded
+                total_size += sizebytes
+                (downloaded, sizebytes) = self.download_media_file(f['url'], force)
+                total_downloads += downloaded
+                total_size += sizebytes
+
+        if "thumbnails" in entry:
+            for t in entry['thumbnails']:
+                (downloaded, sizebytes) = self.download_media_file(t['url'], force)
+                total_downloads += downloaded
+                total_size += sizebytes
+                if 'link' in t and '//m.friendfeed-media.com/' in t['link']:
+                    # note that these two URLs serve the same content:
+                    #   http://m.friendfeed-media.com/(40 char UUID/digest)
+                    #   http://friendfeed-media.s3.amazonaws.com/(40 char UUID/digest)
+                    # so we only need to grab one.  The s3 URL only seems to show up
+                    # in the v1 media[]{content[]} data, v2 uses cloudfront
+                    (downloaded, sizebytes) = self.download_media_file(t['link'], force)
+                    total_downloads += downloaded
+                    total_size += sizebytes
+
+        if 'service' in entry:
+            if 'iconUrl' in entry['service']:
+                iconUrl = entry['service']['iconUrl']
+                (downloaded, sizebytes) = self.download_media_file(iconUrl, force)
+                total_downloads += downloaded
+                total_size += sizebytes
+
+        return (total_downloads, total_size)
+
+    def download_media_file(self, url, force=False):
+        """
+        Store the media in the database.
+        Will determine the mimetype and the size automatically.
+        """
+        sizebytes = self.have_media(url)
+        downloaded = 0
+        if sizebytes is None or force:
+            downloaded = 1
+            c = self.db.cursor()
+            debug("downloading %r" % (url,))
+            fdata, headers = download(url)
+
+            # attempt to extract a UUID/hash from the URL
+            for hashpat in (r'/([0-9a-f]{40})$', r'v=([0-9a-f]{32})$'):
+                sre = re.search(hashpat, url, re.I)
+                if sre:
+                    urlhash = sre.groups()[0].lower()
+                    break
+            else:
+                urlhash = sha1(url).hexdigest().lower()
+
+            sizebytes = int(headers.getheader('content-length'))
+            mimetype = headers.gettype()
+            updatedat = int(time.time())
+            fdata = sqlite3.Binary(fdata.read(sizebytes))
+
+            c.execute("insert or replace into media (url, urlhash, updatedat, sizebytes, mimetype, data) values (?,?,?,?,?,?)",
+                    (url, urlhash, updatedat, sizebytes, mimetype, fdata))
+            self.db.commit()
+
+        return (downloaded, sizebytes)
+
+
+if __name__ == '__main__':
+    parser = optparse.OptionParser("Usage: %prog [options] <feedname>")
+    parser.add_option("-v", "--verbose", dest="debug", action="store_true", 
+                default=False, help="print progress information")
+    parser.add_option("-q", "--quiet", dest="debug", action="store_false", 
+                help="be quit, print not progress information")
+    parser.add_option("-c", "--cachedir", dest='cachedir', action="store", type="string",
+                default=CACHEDIR, help="the directory to store a cache of downloaded content (for debugging), defaults to "+CACHEDIR)
+    parser.add_option("--dbdir", dest='dbdir', action="store", type="string",
+                default=DBDIR, help="the directory to store the database in, defaults to "+DBDIR)
+    parser.add_option("-r", "--remerge", dest="domerge", action="store_true", 
+                default=False, help="remerge the raw v1 and v2 json structures for all entires")
+    parser.add_option("-m", "--media", dest="domedia", action="store_true",
+                default=False, help="download any missing media entries for all entries")
+    parser.add_option("-j", "--jsondump", dest="jsondump", action="store_true",
+                default=True, help="write all json to files to the cachedir (for debugging)")
+    parser.add_option("-d", "--deleted", dest="deletedcheck", action="store_true",
+                default=False, help="check to see if any entry have been deleted (unimplemented)")
+    parser.add_option("-a", "--all", dest="iterateall", action="store_true",
+                default=False, help="iterate over all entries, forcing a full update")
+    parser.add_option("-s", "--stats", dest="showstats", action="store_true",
+                default=False, help="show statistics on the archived feed")
+
+
+    options,args = parser.parse_args()
+    if not len(args):
+        parser.print_help(file=sys.stderr)
+        sys.exit(1)
+
+    DEBUGGING = options.debug
+    CACHEDIR = options.cachedir
+    DBDIR = options.dbdir
+
+    pprint([CACHEDIR, DBDIR])
+    sys.exit(0)
+
+    feedname = args[0]
+    ffdb = FriendFeedDatabase(feedname)
+
+    if options.domerge:
+        ffdb.all_entries_remerge()
+        sys.exit(0)
+
+    if options.domedia:
+        ffdb.all_entries_get_media()
+        sys.exit(0)
+
+    if options.jsondump:
+        ffdb.all_entries_json_dump()
+        sys.exit(0)
+
+    if options.deletedcheck:
+        ffdb.all_entries_check_deleted()
+        sys.exit(0)
+
+    if options.showstats:
+        ffdb.show_stats()
+        sys.exit(0)
+
+    download_feed_entries(feedname, options)
+
+
+# vim: ts=4 expandtab
