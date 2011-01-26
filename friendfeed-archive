@@ -503,7 +503,7 @@ if __name__ == '__main__':
     parser.add_option("-m", "--media", dest="domedia", action="store_true",
                 default=False, help="download any missing media entries for all entries")
     parser.add_option("-j", "--jsondump", dest="jsondump", action="store_true",
-                default=True, help="write all json to files to the cachedir (for debugging)")
+                default=False, help="write all json to files to the cachedir (for debugging)")
     parser.add_option("-d", "--deleted", dest="deletedcheck", action="store_true",
                 default=False, help="check to see if any entry have been deleted (unimplemented)")
     parser.add_option("-a", "--all", dest="iterateall", action="store_true",
@@ -520,9 +520,6 @@ if __name__ == '__main__':
     DEBUGGING = options.debug
     CACHEDIR = options.cachedir
     DBDIR = options.dbdir
-
-    pprint([CACHEDIR, DBDIR])
-    sys.exit(0)
 
     feedname = args[0]
     ffdb = FriendFeedDatabase(feedname)
