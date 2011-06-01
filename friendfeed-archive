@@ -85,12 +85,14 @@ def download(url, cachedir=None):
                 w.writelines(r.readlines())
         with file(cacheheaders, "w") as w:
             w.write(pickle.dumps(headers))
+        wascached = False
     else:
         debug("found cached copy of %s" % (url,))
         fn = cachefile
         with file(cacheheaders) as h:
             headers = pickle.loads(h.read())
-    return (file(fn), headers)
+        wascached = True
+    return (file(fn), headers, wascached)
 
 
 def entry_freshness(v2entry):
@@ -176,7 +178,7 @@ def fixup_thumbnails(merged):
                     except Exception, e:
                         raise(e)
                         pass
-              
+
             # set titles
             if v1media['title']:
                 thumb['title'] = v1media['title']
@@ -215,7 +217,7 @@ def download_v1(eid):
     """
     urlformat = "%(apiv1_base)s/feed/entry?entry_id=%(eid)s&pretty=1"
     url = urlformat % {'apiv1_base': APIV1_BASE, 'eid': eid}
-    jsonfile, _headers = download(url)
+    jsonfile, _headers, _cachedp = download(url)
     ffdata = simplejson.load(jsonfile)
     if "entries" not in ffdata:
         return {}
@@ -239,7 +241,7 @@ def download_feed_entries(feed, options):
     urlformat = "%(apiv2_base)s/feed/%(feed)s?raw=1&start=%(start)d&num=100&pretty=1&maxcomments=%(maxcomments)d&maxlikes=%(maxlikes)d"
     while True:
         url = urlformat % vars
-        jsonfile, _headers = download(url)
+        jsonfile, _headers, _cachedp = download(url)
         ffdata = simplejson.load(jsonfile)
         debug("got %d entries at offset %d" % (len(ffdata['entries']), vars['start']))
         if not len(ffdata['entries']):
@@ -384,7 +386,7 @@ class FriendFeedDatabase:
         c.execute("""insert or replace into entry 
                 (id, edate, edate_unix, lastupdate, deleted, apiv1_json, apiv2_json, entry_json)
                 values
-                (?,?,?,?,?,?,?,?)""", 
+                (?,?,?,?,?,?,?,?)""",
                 (eid, edate, edate_unix, lastupdate, 0, v1json, v2json, mgjson))
         self.db.commit()
         debug("wrote entry %s" % (eid,))
@@ -408,15 +410,32 @@ class FriendFeedDatabase:
             u.execute("update entry set entry_json = ?, edate = ?, edate_unix = ?, lastupdate = ? where id = ?", v)
             sys.stderr.write(" took %0.4fs\n" % (time.time() - start))
 
-    def all_entries_get_media(self):
-        c = self.db.cursor()
-        entries = c.execute("select id, entry_json from entry")
+    def get_media_for_all_entries(self, force=False):
+        entries = self.db.execute("select id, entry_json from entry")
+        entries = list(entries) # consume all rows returned, we can't use seem to use nested queries properly
         for eid, entry_json in entries:
-            start = time.time()
-            sys.stderr.write("downloading media for entry %s" % (eid,))
-            entry = simplejson.loads(entry_json)
-            (total_downloads, total_size) = self.download_entrys_media(entry, force=True)
-            sys.stderr.write(" took %0.4fs (%d files, %d bytes)\n" % ((time.time() - start), total_downloads, total_size))
+            self._dlmedia(eid, entry_json, force=force)
+
+    def get_media_for_some_entries(self, eids, force=False):
+        self.db.execute("create temporary table _a (eid text)")
+        for eid in eids:
+            # a fully formed entry id OR just the uuid could have been specified
+            if not eid.startswith('e/'):
+                eid = 'e/'+eid
+            eid = eid + '%' # allow partial prefixes of uuids to work in the LIKE clause below
+            self.db.execute("insert into _a values (?)", (eid,))
+
+        entries = self.db.execute("select distinct entry.id, entry.entry_json from entry join _a on entry.id like _a.eid")
+        entries = list(entries) # consume all rows returned, we can't use seem to use nested queries properly
+        for eid, entry_json in entries:
+            self._dlmedia(eid, entry_json, force=force)
+
+    def _dlmedia(self, eid, entry_json, force=False):
+        start = time.time()
+        sys.stderr.write("downloading media for entry %s" % (eid,))
+        entry = simplejson.loads("" + entry_json)
+        (total_downloads, total_size) = self.download_entrys_media(entry, force=force)
+        sys.stderr.write(" took %0.4fs (%d files, %d bytes)\n" % ((time.time() - start), total_downloads, total_size))
 
     def download_entrys_media(self, entry, force=False):
         total_downloads = 0
@@ -465,7 +484,7 @@ class FriendFeedDatabase:
             downloaded = 1
             c = self.db.cursor()
             debug("downloading %r" % (url,))
-            fdata, headers = download(url)
+            fdata, headers, _cachedp = download(url)
 
             # attempt to extract a UUID/hash from the URL
             for hashpat in (r'/([0-9a-f]{40})$', r'v=([0-9a-f]{32})$'):
@@ -489,25 +508,27 @@ class FriendFeedDatabase:
 
 
 if __name__ == '__main__':
-    parser = optparse.OptionParser("Usage: %prog [options] <feedname>")
-    parser.add_option("-v", "--verbose", dest="debug", action="store_true", 
+    parser = optparse.OptionParser("Usage: %prog [options] <feedname> [ <eid> ... ]\n<eid> can be a prefix of an entry UUID")
+    parser.add_option("-v", "--verbose", dest="debug", action="store_true",
                 default=False, help="print progress information")
-    parser.add_option("-q", "--quiet", dest="debug", action="store_false", 
+    parser.add_option("-q", "--quiet", dest="debug", action="store_false",
                 help="be quit, print not progress information")
     parser.add_option("-c", "--cachedir", dest='cachedir', action="store", type="string",
                 default=CACHEDIR, help="the directory to store a cache of downloaded content (for debugging), defaults to "+CACHEDIR)
     parser.add_option("--dbdir", dest='dbdir', action="store", type="string",
                 default=DBDIR, help="the directory to store the database in, defaults to "+DBDIR)
-    parser.add_option("-r", "--remerge", dest="domerge", action="store_true", 
+    parser.add_option("-f", "--force", dest="force", action="store_true",
+                default=False, help="force the action, even if the database already seems to have the data")
+    parser.add_option("-r", "--remerge", dest="domerge", action="store_true",
                 default=False, help="remerge the raw v1 and v2 json structures for all entires")
     parser.add_option("-m", "--media", dest="domedia", action="store_true",
-                default=False, help="download any missing media entries for all entries")
+                default=False, help="download media, -a for all entries, or specific <eid>")
     parser.add_option("-j", "--jsondump", dest="jsondump", action="store_true",
                 default=False, help="write all json to files to the cachedir (for debugging)")
     parser.add_option("-d", "--deleted", dest="deletedcheck", action="store_true",
                 default=False, help="check to see if any entry have been deleted (unimplemented)")
     parser.add_option("-a", "--all", dest="iterateall", action="store_true",
-                default=False, help="iterate over all entries, forcing a full update")
+                default=False, help="iterate over all entries")
     parser.add_option("-s", "--stats", dest="showstats", action="store_true",
                 default=False, help="show statistics on the archived feed")
 
@@ -529,7 +550,10 @@ if __name__ == '__main__':
         sys.exit(0)
 
     if options.domedia:
-        ffdb.all_entries_get_media()
+        if options.iterateall:
+            ffdb.get_media_for_all_entries(force=options.force)
+        else:
+            ffdb.get_media_for_some_entries(args[1:], force=options.force)
         sys.exit(0)
 
     if options.jsondump:
