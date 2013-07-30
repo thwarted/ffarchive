@@ -176,7 +176,7 @@ def fixup_thumbnails(merged):
                                 thumb['name'] = name
                                 break
                     except Exception, e:
-                        raise(e)
+                        debug("%r" % (e,))
                         pass
 
             # set titles
@@ -484,28 +484,31 @@ class FriendFeedDatabase:
             downloaded = 1
             c = self.db.cursor()
             debug("downloading %r" % (url,))
-            fdata, headers, _cachedp = download(url)
+            try:
+                fdata, headers, _cachedp = download(url)
 
-            # attempt to extract a UUID/hash from the URL
-            for hashpat in (r'/([0-9a-f]{40})$', r'v=([0-9a-f]{32})$'):
-                sre = re.search(hashpat, url, re.I)
-                if sre:
-                    urlhash = sre.groups()[0].lower()
-                    break
-            else:
-                urlhash = sha1(url).hexdigest().lower()
+                # attempt to extract a UUID/hash from the URL
+                for hashpat in (r'/([0-9a-f]{40})$', r'v=([0-9a-f]{32})$'):
+                    sre = re.search(hashpat, url, re.I)
+                    if sre:
+                        urlhash = sre.groups()[0].lower()
+                        break
+                else:
+                    urlhash = sha1(url).hexdigest().lower()
 
-            contentlen = headers.getheader('content-length')
-            if contentlen:
-                sizebytes = int(contentlen)
-                mimetype = headers.gettype()
-                updatedat = int(time.time())
-                fdata = sqlite3.Binary(fdata.read(sizebytes))
+                contentlen = headers.getheader('content-length')
+                if contentlen:
+                    sizebytes = int(contentlen)
+                    mimetype = headers.gettype()
+                    updatedat = int(time.time())
+                    fdata = sqlite3.Binary(fdata.read(sizebytes))
 
-                c.execute("insert or replace into media (url, urlhash, updatedat, sizebytes, mimetype, data) values (?,?,?,?,?,?)",
-                        (url, urlhash, updatedat, sizebytes, mimetype, fdata))
-                self.db.commit()
-
+                    c.execute("insert or replace into media (url, urlhash, updatedat, sizebytes, mimetype, data) values (?,?,?,?,?,?)",
+                            (url, urlhash, updatedat, sizebytes, mimetype, fdata))
+                    self.db.commit()
+            except Exception, e:
+                debug("%r" % (e,))
+                downloaded, sizebytes = 0, 0
         return (downloaded, sizebytes)
 
 
