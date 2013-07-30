@@ -495,14 +495,16 @@ class FriendFeedDatabase:
             else:
                 urlhash = sha1(url).hexdigest().lower()
 
-            sizebytes = int(headers.getheader('content-length'))
-            mimetype = headers.gettype()
-            updatedat = int(time.time())
-            fdata = sqlite3.Binary(fdata.read(sizebytes))
+            contentlen = headers.getheader('content-length')
+            if contentlen:
+                sizebytes = int(contentlen)
+                mimetype = headers.gettype()
+                updatedat = int(time.time())
+                fdata = sqlite3.Binary(fdata.read(sizebytes))
 
-            c.execute("insert or replace into media (url, urlhash, updatedat, sizebytes, mimetype, data) values (?,?,?,?,?,?)",
-                    (url, urlhash, updatedat, sizebytes, mimetype, fdata))
-            self.db.commit()
+                c.execute("insert or replace into media (url, urlhash, updatedat, sizebytes, mimetype, data) values (?,?,?,?,?,?)",
+                        (url, urlhash, updatedat, sizebytes, mimetype, fdata))
+                self.db.commit()
 
         return (downloaded, sizebytes)
 
