@@ -312,7 +312,7 @@ class FriendFeedDatabase:
             ('avg posts per month', "select avg(c) from (select strftime('%Y-%m', edate) as yw, count(1) as c from entry group by 1) as t", '{0:.2f}'),
             ('', '', ''),
             ('media files', 'select count(1) from media', '{0:d}'),
-            ('media type counts', 'select count(1), mimetype from media group by 2 order by 1 desc', '{0: 4d} {1:s}')
+            ('media type counts', 'select count(1), mimetype from media group by 2 order by 1 desc', '{0: 6d} {1:s}')
         )
         c = self.db.cursor()
         f = string.Formatter()
