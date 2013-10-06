@@ -239,6 +239,8 @@ def download_feed_entries(feed, options):
 
     vars = {'start': 0, 'maxcomments': MAX_COMMENTS, 'maxlikes': MAX_LIKES, 'apiv2_base': APIV2_BASE, 'feed': feed}
     urlformat = "%(apiv2_base)s/feed/%(feed)s?raw=1&start=%(start)d&num=100&pretty=1&maxcomments=%(maxcomments)d&maxlikes=%(maxlikes)d"
+    totalemptygroups = 40
+    emptygroupsseen = totalemptygroups
     while True:
         url = urlformat % vars
         jsonfile, _headers, _cachedp = download(url)
@@ -250,9 +252,14 @@ def download_feed_entries(feed, options):
         updated_entries = save_entries(ffdata['entries'])
         if updated_entries:
             vars['start'] += updated_entries
+            emptygroupsseen = totalemptygroups
         else:
-            debug("didn't update any entries from batch at offset %d, no more changed entries after this" % (vars['start']),)
-            break
+            debug("didn't update any entries from batch at offset %d" % (vars['start']),)
+            emptygroupsseen -= 1
+            vars['start'] += 100
+            if emptygroupsseen <= 0:
+                break
+            debug("need %d more empty groups" % (emptygroupsseen,))
 
 
 class FriendFeedDatabase:
