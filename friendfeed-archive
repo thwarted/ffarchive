@@ -73,8 +73,17 @@ def download(url, cachedir=None):
     fssafeurl = re.sub(r'\W', '_', url)
     cachefile = os.path.join(cachedir, "cache-%s.%s" % (fssafeurl, sha1(url).hexdigest()))
     cacheheaders = os.path.join(cachedir, "cache-%s.%s.headers.pickle" % (fssafeurl, sha1(url).hexdigest()))
-    if not os.path.isfile(cachefile) or not os.path.isfile(cacheheaders):
+    onedayago = time.time() - (24 * 60 * 60)
+    if not os.path.isfile(cachefile) or not os.path.isfile(cacheheaders) or os.path.getmtime(cachefile) < onedayago:
         debug("downloading %s" % (url,))
+        try:
+            os.unlink(cachefile)
+        except:
+            pass
+        try:
+            os.unlink(cacheheaders)
+        except:
+            pass
         try:
             fn, headers = urllib.urlretrieve(url)
         except IOError, e:
