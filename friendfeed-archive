@@ -198,11 +198,11 @@ def fixup_thumbnails(merged):
                         pass
 
             # set titles
-            if v1media['title']:
+            if 'title' in v1media and v1media['title']:
                 thumb['title'] = v1media['title']
-            elif thumb['name']:
+            elif 'name' in thumb and thumb['name']:
                 thumb['title'] = thumb['name']
-            debug("assigning title %r for thumbnail %r from v1 thumbnail" % (thumb['title'], thumb['url']))
+                debug("assigning title %r for thumbnail %r from v1 thumbnail" % (thumb['title'], thumb['url']))
         else:
             thumb['title'] = merged['title']
             debug("falling back to assigning title for thumbnail %r from v1 title" % (thumb['url'],))
