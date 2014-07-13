@@ -274,8 +274,21 @@ def download_feed_entries(feed, options):
     emptygroupsseen = totalemptygroups
     while True:
         url = urlformat % vars
-        jsonfile, _headers, _cachedp = download(url)
-        ffdata = simplejson.load(jsonfile)
+        tries = 1
+        while True:
+            try:
+                jsonfile, _headers, _cachedp = download(url)
+                ffdata = simplejson.load(jsonfile)
+            except Exception, e:
+                print e
+                clearcachefor(url)
+                time.sleep(tries)
+                tries += 1
+                if tries < 5:
+                    continue
+                else:
+                    raise e
+            break
         debug("got %d entries at offset %d" % (len(ffdata['entries']), vars['start']))
         if not len(ffdata['entries']):
             # no entries exist at the specified starting entry
