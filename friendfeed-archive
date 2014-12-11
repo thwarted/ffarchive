@@ -77,8 +77,14 @@ def gencachepaths(url, cachedir=None):
 
 def clearcachefor(url, cachedir=None):
     cachefile, cacheheaders = gencachepaths(url, cachedir)
-    os.unlink(cachefile)
-    os.unlink(cacheheaders)
+    try:
+        os.unlink(cachefile)
+    except:
+        pass
+    try:
+        os.unlink(cacheheaders)
+    except:
+        pass
 
 def download(url, cachedir=None):
     cachefile, cacheheaders = gencachepaths(url, cachedir)
@@ -557,6 +563,8 @@ class FriendFeedDatabase:
                     c.execute("insert or replace into media (url, urlhash, updatedat, sizebytes, mimetype, data) values (?,?,?,?,?,?)",
                             (url, urlhash, updatedat, sizebytes, mimetype, fdata))
                     self.db.commit()
+                else:
+                    sizebytes = 0
             except Exception, e:
                 debug("%r" % (e,))
                 downloaded, sizebytes = 0, 0
