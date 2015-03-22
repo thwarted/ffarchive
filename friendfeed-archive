@@ -277,7 +277,7 @@ def download_feed_entries(feed, options):
 
     vars = {'start': 0, 'maxcomments': MAX_COMMENTS, 'maxlikes': MAX_LIKES, 'apiv2_base': APIV2_BASE, 'feed': feed}
     urlformat = "%(apiv2_base)s/feed/%(feed)s?raw=1&start=%(start)d&num=100&pretty=1&maxcomments=%(maxcomments)d&maxlikes=%(maxlikes)d"
-    totalemptygroups = 40
+    totalemptygroups = 10
     emptygroupsseen = totalemptygroups
     while True:
         url = urlformat % vars
